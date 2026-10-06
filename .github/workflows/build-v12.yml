@@ -73,7 +73,9 @@ jobs:
           fi
 
           echo "Project root: $ROOT"
-          test -f "$ROOT/app/build.gradle"
+          test -f "$ROOT/settings.gradle" -o -f "$ROOT/settings.gradle.kts"
+          test -f "$ROOT/build.gradle" -o -f "$ROOT/build.gradle.kts"
+          test -f "$ROOT/app/build.gradle" -o -f "$ROOT/app/build.gradle.kts"
           echo "project_root=$ROOT" >> "$GITHUB_ENV"
 
       - name: Validate V12 identity
@@ -83,41 +85,63 @@ jobs:
           BUILD_FILE="$project_root/app/build.gradle"
 
           grep -q "applicationId 'v12.marcelo.virtuselm'" "$BUILD_FILE"
+          grep -q "versionCode 146" "$BUILD_FILE"
+          grep -q "versionName '12.0'" "$BUILD_FILE"
+          grep -q "signingConfig signingConfigs.release" "$BUILD_FILE"
 
-          VERSION_CODE="$(sed -nE 's/^[[:space:]]*versionCode[[:space:]]+([0-9]+).*/\1/p' "$BUILD_FILE" | head -1)"
-          VERSION_NAME="$(sed -nE "s/^[[:space:]]*versionName[[:space:]]+['\"]([^'\"]+)['\"].*/\1/p" "$BUILD_FILE" | head -1)"
-
-          test -n "$VERSION_CODE"
-          test "$VERSION_CODE" -gt 0
-          test -n "$VERSION_NAME"
-          grep -q "gradle-8.7-bin.zip" "$project_root/gradle/wrapper/gradle-wrapper.properties"
-
-          echo "V12 versionCode: $VERSION_CODE"
-          echo "V12 versionName: $VERSION_NAME"
-          echo "V12_VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
-          echo "V12_VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
-          echo "V12 identity validated."
+          echo "V12 identity and release signing configuration validated."
 
       - name: Prepare permanent V12 keystore
         shell: bash
         env:
           V12_KEYSTORE_BASE64: ${{ secrets.V12_KEYSTORE_BASE64 }}
           V12_KEYSTORE_PASSWORD: ${{ secrets.V12_KEYSTORE_PASSWORD }}
+          V12_KEY_ALIAS: ${{ secrets.V12_KEY_ALIAS }}
+          V12_KEY_PASSWORD: ${{ secrets.V12_KEY_PASSWORD }}
         run: |
           set -euo pipefail
+
           test -n "$V12_KEYSTORE_BASE64"
           test -n "$V12_KEYSTORE_PASSWORD"
+          test -n "$V12_KEY_ALIAS"
+          test -n "$V12_KEY_PASSWORD"
 
           CLEAN_BASE64="$(printf '%s' "$V12_KEYSTORE_BASE64" | tr -d '[:space:]')"
           CLEAN_BASE64="${CLEAN_BASE64#data:application/octet-stream;base64,}"
           test -n "$CLEAN_BASE64"
 
-          printf '%s' "$CLEAN_BASE64" | base64 --decode --ignore-garbage > "$RUNNER_TEMP/v12-release.keystore"
+          printf '%s' "$CLEAN_BASE64" | base64 --decode > "$RUNNER_TEMP/v12-release.keystore"
           chmod 600 "$RUNNER_TEMP/v12-release.keystore"
           test -s "$RUNNER_TEMP/v12-release.keystore"
 
-          keytool -list -keystore "$RUNNER_TEMP/v12-release.keystore" -storepass "$V12_KEYSTORE_PASSWORD" >/dev/null
-          echo "V12 keystore prepared and validated."
+          keytool -list \
+            -keystore "$RUNNER_TEMP/v12-release.keystore" \
+            -storepass "$V12_KEYSTORE_PASSWORD" \
+            -alias "$V12_KEY_ALIAS" \
+            >/dev/null
+
+          echo "V12 keystore and keypair validated."
+
+      - name: Install and verify Gradle 8.7
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          GRADLE_URL="https://services.gradle.org/distributions/gradle-8.7-bin.zip"
+          GRADLE_ZIP="$RUNNER_TEMP/gradle-8.7-bin.zip"
+          GRADLE_SUM="$RUNNER_TEMP/gradle-8.7-bin.zip.sha256"
+
+          curl -fsSL "$GRADLE_URL" -o "$GRADLE_ZIP"
+          curl -fsSL "${GRADLE_URL}.sha256" -o "$GRADLE_SUM"
+
+          cd "$RUNNER_TEMP"
+          sha256sum -c "$(basename "$GRADLE_SUM")"
+
+          rm -rf "$RUNNER_TEMP/gradle-8.7"
+          unzip -q "$GRADLE_ZIP" -d "$RUNNER_TEMP"
+
+          test -x "$RUNNER_TEMP/gradle-8.7/bin/gradle"
+          "$RUNNER_TEMP/gradle-8.7/bin/gradle" --version
 
       - name: Build signed V12 Release
         shell: bash
@@ -129,26 +153,34 @@ jobs:
         run: |
           set -euo pipefail
           cd "$project_root"
-          chmod +x ./gradlew
-          ./gradlew --version
-          ./gradlew clean assembleRelease --no-daemon
+
+          "$RUNNER_TEMP/gradle-8.7/bin/gradle" \
+            clean assembleRelease \
+            --no-daemon \
+            --stacktrace
 
       - name: Verify APK
         shell: bash
         run: |
           set -euo pipefail
-          APK="$(find "$project_root/app/build/outputs/apk/release" -maxdepth 1 -type f -name '*.apk' -print -quit)"
+
+          APK="$(find "$project_root/app/build/outputs/apk/release" \
+            -maxdepth 1 -type f -name '*.apk' -print -quit)"
+
           test -n "$APK"
           echo "APK: $APK"
 
           "$ANDROID_SDK_ROOT/build-tools/34.0.0/apksigner" verify --verbose "$APK"
 
           BADGING="$("$ANDROID_SDK_ROOT/build-tools/34.0.0/aapt" dump badging "$APK")"
+
           echo "$BADGING" | grep -q "package: name='v12.marcelo.virtuselm'"
-          echo "$BADGING" | grep -q "versionCode='$V12_VERSION_CODE'"
-          echo "$BADGING" | grep -q "versionName='$V12_VERSION_NAME'"
+          echo "$BADGING" | grep -q "versionCode='146'"
+          echo "$BADGING" | grep -q "versionName='12.0'"
 
           cp "$APK" "$GITHUB_WORKSPACE/VirtusELM-V12-release.apk"
+
+          echo "APK release verified successfully."
 
       - name: Upload signed APK
         uses: actions/upload-artifact@v4
@@ -163,3 +195,8 @@ jobs:
         shell: bash
         run: |
           rm -f "$RUNNER_TEMP/v12-release.keystore"
+          rm -f "$RUNNER_TEMP/keypair-test.keystore"
+          rm -f "$RUNNER_TEMP/gradle-8.7-bin.zip"
+          rm -f "$RUNNER_TEMP/gradle-8.7-bin.zip.sha256"
+          rm -rf "$RUNNER_TEMP/gradle-8.7"
+          rm -rf "$RUNNER_TEMP/v12-src"
