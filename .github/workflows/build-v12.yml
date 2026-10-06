@@ -129,13 +129,14 @@ jobs:
 
           GRADLE_URL="https://services.gradle.org/distributions/gradle-8.7-bin.zip"
           GRADLE_ZIP="$RUNNER_TEMP/gradle-8.7-bin.zip"
-          GRADLE_SUM="$RUNNER_TEMP/gradle-8.7-bin.zip.sha256"
+
+          EXPECTED_SHA="544c35d6bd849ae8a5ed0bcea39ba677dc40f49df7d1835561582da2009b961d"
 
           curl -fsSL "$GRADLE_URL" -o "$GRADLE_ZIP"
-          curl -fsSL "${GRADLE_URL}.sha256" -o "$GRADLE_SUM"
 
-          cd "$RUNNER_TEMP"
-          sha256sum -c "$(basename "$GRADLE_SUM")"
+          ACTUAL_SHA="$(sha256sum "$GRADLE_ZIP" | cut -d' ' -f1)"
+
+          test "$EXPECTED_SHA" = "$ACTUAL_SHA"
 
           rm -rf "$RUNNER_TEMP/gradle-8.7"
           unzip -q "$GRADLE_ZIP" -d "$RUNNER_TEMP"
@@ -197,6 +198,5 @@ jobs:
           rm -f "$RUNNER_TEMP/v12-release.keystore"
           rm -f "$RUNNER_TEMP/keypair-test.keystore"
           rm -f "$RUNNER_TEMP/gradle-8.7-bin.zip"
-          rm -f "$RUNNER_TEMP/gradle-8.7-bin.zip.sha256"
           rm -rf "$RUNNER_TEMP/gradle-8.7"
           rm -rf "$RUNNER_TEMP/v12-src"
