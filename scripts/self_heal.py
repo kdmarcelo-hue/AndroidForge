@@ -1,32 +1,8 @@
 #!/usr/bin/env python3
 """AndroidForge — Self-Healing System.
 
-Runs AFTER setup_environment.py and BEFORE build_project.py. Scans the
-project for common, well-known issues and applies non-destructive fixes
-in the workspace (never touches the source ZIP).
-
-Issues it auto-fixes:
-  1. AGP version requires a newer Gradle than the project's wrapper pins.
-     → If a wrapper exists, bump the wrapper's distributionUrl to the
-       required Gradle version. If no wrapper exists, this is a no-op
-       (build_project.py already falls back to system gradle).
-  2. gradlew missing or wrapper jar missing.
-     → Run `gradle wrapper` to regenerate (best-effort).
-  3. Missing local.properties (sdk.dir).
-     → Already handled by setup_environment.py; self_heal double-checks.
-  4. Duplicate top-level Kotlin/Java class names across source dirs.
-     → Detect + warn (DO NOT auto-delete — that's destructive; surface
-       a clear actionable error instead).
-  5. Settings file uses RepositoriesMode.FAIL_ON_PROJECT_REPOS but
-     build.gradle declares project-level repos.
-     → setup_environment.py already handles this; self_heal warns if
-       it sees the conflict still present.
-  6. AndroidManifest.xml missing package attribute (very old projects).
-     → Add `package="..."` based on the namespace from build.gradle.
-
-The script writes a JSON report to stdout (and to $GITHUB_OUTPUT for
-the workflow). It NEVER fails the build — fixes are best-effort, and
-unfixed issues are reported so the diagnosis step can pick them up.
+Aplica correções não destrutivas no workspace extraído, sem alterar o ZIP
+original. Mantém a interface CLI utilizada pelo workflow AndroidForge.
 """
 from __future__ import annotations
 
@@ -40,12 +16,6 @@ from pathlib import Path
 from typing import Any
 
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 def read_file(path: Path) -> str:
     try:
         return path.read_text(encoding="utf-8", errors="replace")
@@ -54,319 +24,230 @@ def read_file(path: Path) -> str:
 
 
 def parse_agp_version(content: str) -> str | None:
-    """Extract AGP version from a Kotlin/Groovy build file."""
-    # Modern Kotlin DSL: id("com.android.application") version "8.5.2"
-    m = re.search(r'id\s*\(\s*["\']com\.android\.application["\']\s*\)\s*version\s*["\']([^"\']+)["\']', content)
-    if m:
-        return m.group(1).strip()
-    # Modern Kotlin DSL (no parens): id "com.android.application" version "8.5.2"
-    m = re.search(r'id\s+["\']com\.android\.application["\'].*?version\s*["\']([^"\']+)["\']', content)
-    if m:
-        return m.group(1).strip()
-    # Old Groovy: classpath 'com.android.tools.build:gradle:8.5.2'
-    m = re.search(r"com\.android\.tools\.build:gradle:([^'\"\s]+)", content)
-    if m:
-        return m.group(1).strip()
+    patterns = [
+        r'id\s*\(\s*["\']com\.android\.application["\']\s*\)\s*version\s*["\']([^"\']+)',
+        r'id\s+["\']com\.android\.application["\'].*?version\s*["\']([^"\']+)',
+        r"com\.android\.tools\.build:gradle:([^'\"\s]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, content)
+        if match:
+            return match.group(1).strip()
     return None
 
 
-def parse_gradle_wrapper_version(wrapper_props: str) -> str | None:
-    m = re.search(r"gradle-([\d.]+)-\w+\.zip", wrapper_props)
-    return m.group(1) if m else None
+def parse_gradle_wrapper_version(content: str) -> str | None:
+    match = re.search(r"gradle-([\d.]+)-\w+\.zip", content)
+    return match.group(1) if match else None
 
 
-def version_tuple(v: str) -> tuple[int, ...]:
-    """Convert '8.5.2' → (8, 5, 2). Returns (0,) on parse failure."""
+def version_tuple(value: str) -> tuple[int, ...]:
     try:
-        return tuple(int(p) for p in v.split("."))
+        return tuple(int(part) for part in value.split("."))
     except ValueError:
         return (0,)
 
 
-# Reference: https://developer.android.com/build/releases/gradle-plugin
 AGP_TO_MIN_GRADLE = {
-    "8.7": "8.9",
-    "8.6": "8.7",
-    "8.5": "8.7",
-    "8.4": "8.6",
-    "8.3": "8.4",
-    "8.2": "8.2",
-    "8.1": "8.0",
-    "8.0": "8.0",
-    "7.4": "7.5",
-    "7.3": "7.4",
-    "7.2": "7.3.3",
-    "7.1": "7.2",
-    "7.0": "7.0.2",
-    "4.2": "6.7.1",
-    "4.1": "6.5",
-    "4.0": "6.1.1",
-    "3.6": "5.6.4",
-    "3.5": "5.4.1",
-    "3.4": "5.1.1",
-    "3.3": "4.10.1",
-    "3.2": "4.6",
-    "3.1": "4.4",
-    "3.0": "4.1",
+    "8.7": "8.9", "8.6": "8.7", "8.5": "8.7", "8.4": "8.6",
+    "8.3": "8.4", "8.2": "8.2", "8.1": "8.0", "8.0": "8.0",
+    "7.4": "7.5", "7.3": "7.4", "7.2": "7.3.3", "7.1": "7.2",
+    "7.0": "7.0.2", "4.2": "6.7.1", "4.1": "6.5", "4.0": "6.1.1",
+    "3.6": "5.6.4", "3.5": "5.4.1", "3.4": "5.1.1",
+    "3.3": "4.10.1", "3.2": "4.6", "3.1": "4.4", "3.0": "4.1",
 }
 
 
-def min_gradle_for_agp(agp: str) -> str | None:
-    """Look up the minimum Gradle version required for a given AGP version."""
+def min_gradle_for_agp(agp: str | None) -> str | None:
     if not agp:
         return None
     parts = agp.split(".")
-    # Try exact major.minor match first
-    if len(parts) >= 2:
-        key = f"{parts[0]}.{parts[1]}"
-        if key in AGP_TO_MIN_GRADLE:
-            return AGP_TO_MIN_GRADLE[key]
-    # Fall back to major version
-    major = parts[0]
-    for k, v in AGP_TO_MIN_GRADLE.items():
-        if k.split(".")[0] == major:
-            return v
-    return None
+    if len(parts) >= 2 and f"{parts[0]}.{parts[1]}" in AGP_TO_MIN_GRADLE:
+        return AGP_TO_MIN_GRADLE[f"{parts[0]}.{parts[1]}"]
+    return next((v for k, v in AGP_TO_MIN_GRADLE.items()
+                 if k.split(".")[0] == parts[0]), None)
 
 
-# ---------------------------------------------------------------------------
-# Self-heal actions
-# ---------------------------------------------------------------------------
 def heal_gradle_wrapper(root: Path, agp_version: str | None, fixes: list[dict]) -> None:
-    """If the project's gradle-wrapper pins a version too old for the AGP,
-    bump the wrapper to the minimum required version. Also regenerate the
-    wrapper jar if it's missing.
-    """
-    if not agp_version:
+    minimum = min_gradle_for_agp(agp_version)
+    props = root / "gradle" / "wrapper" / "gradle-wrapper.properties"
+    if not minimum:
         return
-    min_gradle = min_gradle_for_agp(agp_version)
-    if not min_gradle:
+    if not props.exists():
+        fixes.append({"name": "no_wrapper_present", "action": "none",
+                      "reason": "No gradle-wrapper.properties; build uses system Gradle."})
         return
-
-    wrapper_props = root / "gradle" / "wrapper" / "gradle-wrapper.properties"
-    if not wrapper_props.exists():
-        # No wrapper to bump — build_project.py will fall back to system
-        # gradle (which is 8.9 in the Docker image, modern enough for AGP 8.x).
-        fixes.append({
-            "name": "no_wrapper_present",
-            "action": "none",
-            "reason": "No gradle-wrapper.properties — build will use system gradle (Docker image has 8.9).",
-        })
+    content = read_file(props)
+    current = parse_gradle_wrapper_version(content)
+    if not current or version_tuple(current) >= version_tuple(minimum):
         return
-
-    content = read_file(wrapper_props)
-    wrapper_version = parse_gradle_wrapper_version(content)
-    if not wrapper_version:
-        return
-
-    if version_tuple(wrapper_version) >= version_tuple(min_gradle):
-        # Wrapper is already new enough — nothing to do.
-        return
-
-    # Bump the wrapper.
-    new_url = f"https\\://services.gradle.org/distributions/gradle-{min_gradle}-bin.zip"
-    new_content = re.sub(
+    updated = re.sub(
         r"distributionUrl=[^\s]+",
-        f"distributionUrl={new_url}",
+        f"distributionUrl=https\\\\://services.gradle.org/distributions/gradle-{minimum}-bin.zip",
         content,
     )
-    if new_content != content:
-        wrapper_props.write_text(new_content)
-        fixes.append({
-            "name": "bump_gradle_wrapper",
-            "action": "rewrote distributionUrl",
-            "reason": f"Project pins gradle-{wrapper_version} but AGP {agp_version} requires >= {min_gradle}. Bumped wrapper.",
-            "from": wrapper_version,
-            "to": min_gradle,
-        })
+    if updated != content:
+        props.write_text(updated, encoding="utf-8")
+        fixes.append({"name": "bump_gradle_wrapper", "action": "updated distributionUrl",
+                      "reason": f"Gradle {current} is below the minimum {minimum} for AGP {agp_version}.",
+                      "from": current, "to": minimum})
 
 
 def heal_missing_gradlew(root: Path, fixes: list[dict]) -> None:
-    """If gradlew is missing but gradle-wrapper.properties exists, regenerate
-    the wrapper by running `gradle wrapper` (best-effort, never fails).
-    """
     gradlew = root / "gradlew"
-    wrapper_jar = root / "gradle" / "wrapper" / "gradle-wrapper.jar"
-    wrapper_props = root / "gradle" / "wrapper" / "gradle-wrapper.properties"
-
-    if gradlew.exists() and wrapper_jar.exists():
-        return  # nothing to do
-
-    if not wrapper_props.exists():
-        return  # no wrapper to regenerate
-
-    # Try to run `gradle wrapper` (uses system gradle)
+    jar = root / "gradle" / "wrapper" / "gradle-wrapper.jar"
+    props = root / "gradle" / "wrapper" / "gradle-wrapper.properties"
+    if (gradlew.exists() and jar.exists()) or not props.exists():
+        return
     try:
         result = subprocess.run(
             ["gradle", "wrapper", "--distribution-type", "bin"],
-            cwd=str(root),
-            capture_output=True,
-            text=True,
-            timeout=120,
+            cwd=str(root), capture_output=True, text=True, timeout=120,
         )
-        if result.returncode == 0 and gradlew.exists() and wrapper_jar.exists():
-            fixes.append({
-                "name": "regenerate_gradlew",
-                "action": "ran `gradle wrapper`",
-                "reason": "gradlew or gradle-wrapper.jar was missing — regenerated via system gradle.",
-            })
+        if result.returncode == 0 and gradlew.exists() and jar.exists():
+            fixes.append({"name": "regenerate_gradlew", "action": "ran gradle wrapper",
+                          "reason": "Missing wrapper files were regenerated."})
         else:
-            fixes.append({
-                "name": "regenerate_gradlew_failed",
-                "action": "none",
-                "reason": f"`gradle wrapper` exited {result.returncode}: {result.stderr[:200]}",
-            })
-    except Exception as e:
-        fixes.append({
-            "name": "regenerate_gradlew_failed",
-            "action": "none",
-            "reason": f"Exception while running `gradle wrapper`: {e}",
-        })
+            fixes.append({"name": "regenerate_gradlew_failed", "action": "none",
+                          "reason": f"gradle wrapper exited {result.returncode}: {result.stderr[:200]}"})
+    except Exception as exc:
+        fixes.append({"name": "regenerate_gradlew_failed", "action": "none",
+                      "reason": f"Could not regenerate wrapper: {exc}"})
 
 
 def heal_missing_local_properties(root: Path, android_sdk: str, fixes: list[dict]) -> None:
-    """Ensure local.properties exists with sdk.dir pointing to the Android SDK.
-    (setup_environment.py already does this, but self_heal double-checks.)
-    """
-    local_props = root / "local.properties"
-    if local_props.exists():
-        content = read_file(local_props)
-        if "sdk.dir" in content:
-            return
-    local_props.write_text(f"sdk.dir={android_sdk}\n")
-    fixes.append({
-        "name": "create_local_properties",
-        "action": "wrote local.properties",
-        "reason": f"local.properties missing or had no sdk.dir — set sdk.dir={android_sdk}",
-    })
+    target = root / "local.properties"
+    if target.exists() and "sdk.dir" in read_file(target):
+        return
+    target.write_text(f"sdk.dir={android_sdk}\n", encoding="utf-8")
+    fixes.append({"name": "create_local_properties", "action": "wrote local.properties",
+                  "reason": f"Set sdk.dir={android_sdk}"})
 
 
 def detect_duplicate_classes(root: Path, warnings: list[dict]) -> None:
-    """Scan all .kt / .java files for top-level class declarations, warn if
-    the same fully-qualified class name appears in 2+ files (Kotlin refuses
-    to compile 'Redeclaration: class X').
-    """
-    class_to_files: dict[str, list[Path]] = {}
-    for src_ext in ("*.kt", "*.java"):
-        for f in root.rglob(src_ext):
-            # Skip build/ output dirs
-            if "/build/" in str(f) or "\\build\\" in str(f):
+    found: dict[str, list[Path]] = {}
+    for pattern in ("*.kt", "*.java"):
+        for path in root.rglob(pattern):
+            if "build" in path.parts:
                 continue
-            try:
-                content = f.read_text(encoding="utf-8", errors="replace")
-            except Exception:
-                continue
-            # Find package
-            pkg_match = re.search(r"^package\s+([\w.]+)", content, re.MULTILINE)
-            pkg = pkg_match.group(1) if pkg_match else ""
-            # Find top-level class/object names
-            for m in re.finditer(r"^\s*(?:public\s+|internal\s+|private\s+)?(?:final\s+)?(?:class|object|interface|enum class)\s+(\w+)", content, re.MULTILINE):
-                name = m.group(1)
-                fq = f"{pkg}.{name}" if pkg else name
-                class_to_files.setdefault(fq, []).append(f)
-    for fq, files in class_to_files.items():
-        if len(files) > 1:
-            warnings.append({
-                "kind": "duplicate_class",
-                "class": fq,
-                "files": [str(f.relative_to(root) if f.is_relative_to(root) else f) for f in files],
-                "hint": "Kotlin refuses to compile 'Redeclaration: class X'. Delete one of the duplicates.",
-            })
+            source = read_file(path)
+            pkg = re.search(r"^package\s+([\w.]+)", source, re.MULTILINE)
+            package = pkg.group(1) if pkg else ""
+            for match in re.finditer(
+                r"^\s*(?:(?:public|internal|private)\s+)?(?:final\s+)?"
+                r"(?:class|object|interface|enum class)\s+(\w+)",
+                source, re.MULTILINE,
+            ):
+                fqcn = f"{package}.{match.group(1)}" if package else match.group(1)
+                found.setdefault(fqcn, []).append(path)
+    for name, paths in found.items():
+        if len(paths) > 1:
+            warnings.append({"kind": "duplicate_class", "class": name,
+                             "files": [str(p.relative_to(root)) for p in paths],
+                             "hint": "Duplicate top-level class declaration."})
 
 
 def detect_repositories_mode_conflict(root: Path, warnings: list[dict]) -> None:
-    """If settings.gradle(.kts) declares FAIL_ON_PROJECT_REPOS but a
-    build.gradle file still has `repositories { }` (other than inside
-    pluginManagement or buildscript), warn.
-    """
-    settings_files = [
-        root / "settings.gradle",
-        root / "settings.gradle.kts",
-    ]
-    has_forbid = False
-    for sf in settings_files:
-        if not sf.exists():
-            continue
-        if "FAIL_ON_PROJECT_REPOS" in read_file(sf):
-            has_forbid = True
-            break
-    if not has_forbid:
+    settings = [root / "settings.gradle", root / "settings.gradle.kts"]
+    if not any("FAIL_ON_PROJECT_REPOS" in read_file(p) for p in settings if p.exists()):
         return
-
-    for bf in [root / "build.gradle", root / "build.gradle.kts",
-               root / "app" / "build.gradle", root / "app" / "build.gradle.kts"]:
-        if not bf.exists():
+    for build_file in (root / "build.gradle", root / "build.gradle.kts",
+                       root / "app" / "build.gradle", root / "app" / "build.gradle.kts"):
+        if not build_file.exists():
             continue
-        content = read_file(bf)
-        # Look for a `repositories {` block NOT inside `buildscript {}` or
-        # `pluginManagement {}` (those are allowed even with FAIL_ON_PROJECT_REPOS).
-        # Simple heuristic: find `repositories {` and check the surrounding context.
-        for m in re.finditer(r"^\s*repositories\s*\{", content, re.MULTILINE):
-            # Look backwards for buildscript / pluginManagement
-            before = content[:m.start()].rstrip()
-            if before.endswith("buildscript") or "pluginManagement" in before.rsplit("\n", 5)[-1:]:
-                continue
-            warnings.append({
-                "kind": "repositories_mode_conflict",
-                "file": str(bf.relative_to(root) if bf.is_relative_to(root) else bf),
-                "hint": "settings.gradle declares FAIL_ON_PROJECT_REPOS but this build.gradle has a project-level `repositories {}` block — Gradle will fail. Either remove the block from build.gradle or relax the RepositoriesMode in settings.gradle.",
-            })
-            break  # one warning per file is enough
+        source = read_file(build_file)
+        if re.search(r"^\s*repositories\s*\{", source, re.MULTILINE):
+            warnings.append({"kind": "repositories_mode_conflict",
+                             "file": str(build_file.relative_to(root)),
+                             "hint": "Project repositories conflict with FAIL_ON_PROJECT_REPOS."})
+
+
+def _has_namespace(source: str) -> bool:
+    return bool(re.search(r"\bnamespace\s*(?:=|\s)\s*['\"][^'\"]+['\"]", source))
+
+
+def _insert_namespace(source: str, namespace: str) -> str:
+    """Insert namespace into the first android { } block, preserving DSL style."""
+    match = re.search(r"(?m)^([ \t]*)android\s*\{", source)
+    if not match:
+        return source
+    indent = match.group(1) + "    "
+    line = f'{indent}namespace = "{namespace}"\n'
+    # Groovy and Kotlin DSL both accept namespace = "value".
+    return source[:match.end()] + "\n" + line + source[match.end():]
+
+
+def _remove_manifest_package(source: str) -> str:
+    """AGP 8+ requires namespace in Gradle, not package in source manifests."""
+    opening = re.search(r"<manifest\b[^>]*>", source, re.IGNORECASE | re.DOTALL)
+    if not opening:
+        return source
+    tag = opening.group(0)
+    cleaned = re.sub(r'\s+package\s*=\s*("[^"]*"|\'[^\']*\')', "", tag, count=1)
+    return source[:opening.start()] + cleaned + source[opening.end():]
 
 
 def heal_android_manifest_package(root: Path, fixes: list[dict], warnings: list[dict]) -> None:
-    """For very old projects that don't have `namespace` in build.gradle
-    and have an AndroidManifest.xml without a `package` attribute, add one
-    based on the applicationId.
-    """
-    # Find AndroidManifest.xml
+    """Ensure Android namespace is declared in Gradle; never add package to Manifest."""
+    gradle_file = next((p for p in (
+        root / "app" / "build.gradle",
+        root / "app" / "build.gradle.kts",
+    ) if p.exists()), None)
+    if gradle_file is None:
+        return
+
+    gradle_source = read_file(gradle_file)
     manifests = list(root.rglob("AndroidManifest.xml"))
-    if not manifests:
+    if _has_namespace(gradle_source):
+        # Even with a valid namespace, remove legacy package attributes that AGP rejects.
+        changed = []
+        for manifest in manifests:
+            old = read_file(manifest)
+            new = _remove_manifest_package(old)
+            if new != old:
+                manifest.write_text(new, encoding="utf-8")
+                changed.append(str(manifest.relative_to(root)))
+        if changed:
+            fixes.append({"name": "remove_legacy_manifest_package",
+                          "action": "removed package attribute from manifests",
+                          "files": changed,
+                          "reason": "Namespace is already declared in Gradle; AGP 8+ rejects manifest package attributes."})
         return
 
-    # Find applicationId from app/build.gradle(.kts)
-    app_gradle = None
-    for cand in [root / "app" / "build.gradle", root / "app" / "build.gradle.kts"]:
-        if cand.exists():
-            app_gradle = read_file(cand)
-            break
-    if not app_gradle:
+    appid = re.search(
+        r"\bapplicationId\s*(?:=)?\s*['\"]([^'\"]+)['\"]",
+        gradle_source,
+    )
+    if not appid:
+        warnings.append({"kind": "namespace_not_added",
+                         "file": str(gradle_file.relative_to(root)),
+                         "hint": "No namespace or applicationId found; manual review required."})
         return
 
-    # Look for namespace= first (modern AGP)
-    ns_match = re.search(r'namespace\s*=\s*["\']([^"\']+)["\']', app_gradle)
-    if ns_match:
-        return  # namespace is set, no need to patch manifest
-
-    # Look for applicationId
-    appid_match = re.search(r'applicationId\s*["\']?\s*=?\s*["\']([^"\']+)["\']', app_gradle)
-    if not appid_match:
+    namespace = appid.group(1).strip()
+    updated_gradle = _insert_namespace(gradle_source, namespace)
+    if updated_gradle == gradle_source:
+        warnings.append({"kind": "namespace_not_added",
+                         "file": str(gradle_file.relative_to(root)),
+                         "hint": "No android { } block found; namespace was not inserted."})
         return
-    application_id = appid_match.group(1)
 
+    gradle_file.write_text(updated_gradle, encoding="utf-8")
+    cleaned_manifests = []
     for manifest in manifests:
-        content = read_file(manifest)
-        if "package=" in content or 'package =' in content:
-            continue  # already has package attribute
-        # Insert package attribute into the <manifest> opening tag
-        new_content = re.sub(
-            r"(<manifest[^>]*?)(/?>)",
-            rf'\1 package="{application_id}"\2',
-            content,
-            count=1,
-        )
-        if new_content != content:
-            manifest.write_text(new_content)
-            fixes.append({
-                "name": "add_manifest_package",
-                "action": f"added package=\"{application_id}\" to {manifest.relative_to(root) if manifest.is_relative_to(root) else manifest}",
-                "reason": "build.gradle has no `namespace` and AndroidManifest.xml had no `package` attribute — added one based on applicationId.",
-            })
+        old = read_file(manifest)
+        new = _remove_manifest_package(old)
+        if new != old:
+            manifest.write_text(new, encoding="utf-8")
+            cleaned_manifests.append(str(manifest.relative_to(root)))
+
+    fixes.append({"name": "add_gradle_namespace",
+                  "action": f'added namespace = "{namespace}" to {gradle_file.relative_to(root)}',
+                  "reason": "AGP 8+ requires namespace in the module Gradle file; package is not added to AndroidManifest.xml.",
+                  "namespace": namespace,
+                  "manifests_cleaned": cleaned_manifests})
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 def main() -> int:
     parser = argparse.ArgumentParser(description="AndroidForge self-healing system")
     parser.add_argument("--root", required=True, help="Project root path")
@@ -376,88 +257,62 @@ def main() -> int:
     parser.add_argument("--output", default=None, help="Write JSON report to this file")
     args = parser.parse_args()
 
-    def load(s: str) -> Any:
-        if Path(s).exists():
-            return json.loads(Path(s).read_text())
-        return json.loads(s)
+    def load(value: str) -> Any:
+        path = Path(value)
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else json.loads(value)
 
     detect = load(args.detect)
-    toolchain = load(args.toolchain)
+    # Validate the argument even though toolchain data is not needed by current healers.
+    load(args.toolchain)
     root = Path(args.root).resolve()
-
     fixes: list[dict] = []
     warnings: list[dict] = []
 
-    # 1. Gradle wrapper version vs AGP
     agp_version = (detect.get("versions") or {}).get("agp_version")
     if not agp_version:
-        # Fall back to scanning build files directly
-        for grad_file in [root / "build.gradle.kts", root / "build.gradle",
-                          root / "app" / "build.gradle.kts", root / "app" / "build.gradle"]:
-            if grad_file.exists():
-                agp_version = parse_agp_version(read_file(grad_file))
+        for candidate in (root / "build.gradle.kts", root / "build.gradle",
+                          root / "app" / "build.gradle.kts", root / "app" / "build.gradle"):
+            if candidate.exists():
+                agp_version = parse_agp_version(read_file(candidate))
                 if agp_version:
                     break
+
     heal_gradle_wrapper(root, agp_version, fixes)
-
-    # 2. Missing gradlew / wrapper jar
     heal_missing_gradlew(root, fixes)
-
-    # 3. Missing local.properties
     heal_missing_local_properties(root, args.android_sdk, fixes)
-
-    # 4. AndroidManifest package attribute (for old projects)
     heal_android_manifest_package(root, fixes, warnings)
-
-    # 5. Detect duplicate top-level classes (warn-only, do NOT auto-delete)
     detect_duplicate_classes(root, warnings)
-
-    # 6. Detect RepositoriesMode conflict (warn-only)
     detect_repositories_mode_conflict(root, warnings)
 
-    report = {
-        "project_root": str(root),
-        "agp_version": agp_version,
-        "fixes_applied": fixes,
-        "warnings": warnings,
-        "summary": f"{len(fixes)} fix(es) applied, {len(warnings)} warning(s)",
-    }
-
+    report = {"project_root": str(root), "agp_version": agp_version,
+              "fixes_applied": fixes, "warnings": warnings,
+              "summary": f"{len(fixes)} fix(es) applied, {len(warnings)} warning(s)"}
     output = json.dumps(report, indent=2)
     if args.output:
-        Path(args.output).write_text(output)
+        Path(args.output).write_text(output, encoding="utf-8")
     else:
         print(output)
 
-    # Also surface key fields to GITHUB_OUTPUT
     gh_output = os.environ.get("GITHUB_OUTPUT")
     if gh_output:
-        with open(gh_output, "a", encoding="utf-8") as f:
-            f.write(f"self_heal_fixes={len(fixes)}\n")
-            f.write(f"self_heal_warnings={len(warnings)}\n")
-            f.write(f"json<<EOF\n{json.dumps(report)}\nEOF\n")
+        with open(gh_output, "a", encoding="utf-8") as stream:
+            stream.write(f"self_heal_fixes={len(fixes)}\n")
+            stream.write(f"self_heal_warnings={len(warnings)}\n")
+            stream.write(f"json<<EOF\n{json.dumps(report)}\nEOF\n")
 
-    # Also emit a step summary
-    summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
-    if summary_file:
-        with open(summary_file, "a", encoding="utf-8") as f:
-            f.write("\n## 🩹 Self-healing report\n\n")
-            f.write(f"{len(fixes)} fix(es) applied, {len(warnings)} warning(s)\n\n")
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as stream:
+            stream.write("\n## Self-healing report\n\n")
+            stream.write(f"{len(fixes)} fix(es) applied, {len(warnings)} warning(s)\n\n")
             if fixes:
-                f.write("### Fixes applied\n")
+                stream.write("### Fixes applied\n")
                 for fix in fixes:
-                    f.write(f"- **{fix['name']}**: {fix.get('action','')} — {fix.get('reason','')}\n")
-                f.write("\n")
+                    stream.write(f"- **{fix['name']}**: {fix.get('action', '')} — {fix.get('reason', '')}\n")
             if warnings:
-                f.write("### Warnings (not auto-fixable)\n")
-                for w in warnings:
-                    f.write(f"- ⚠️ **{w.get('kind','?')}**: {w.get('hint','')}\n")
-                    if "file" in w:
-                        f.write(f"  - File: `{w['file']}`\n")
-                    if "files" in w:
-                        f.write(f"  - Files: {', '.join(w['files'])}\n")
-                f.write("\n")
-
+                stream.write("\n### Warnings\n")
+                for warning in warnings:
+                    stream.write(f"- **{warning.get('kind', '?')}**: {warning.get('hint', '')}\n")
     return 0
 
 
