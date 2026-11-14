@@ -1,0 +1,91 @@
+name: V12 Direct Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-v12:
+    name: Compile V12 directly
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 34
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+
+      - name: Download Gradle 8.7
+        run: |
+          curl -fsSL https://services.gradle.org/distributions/gradle-8.7-bin.zip -o "$RUNNER_TEMP/gradle-8.7-bin.zip"
+          unzip -q "$RUNNER_TEMP/gradle-8.7-bin.zip" -d "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/gradle-8.7/bin" >> "$GITHUB_PATH"
+
+      - name: Extract V12 source ZIP
+        id: source
+        run: |
+          ZIP="input/V12_12.0.0.14_BUILD25_CORRECOES_INTEGRADAS.zip"
+          test -f "$ZIP"
+          mkdir -p "$RUNNER_TEMP/v12-source"
+          unzip -q "$ZIP" -d "$RUNNER_TEMP/v12-source"
+
+          SETTINGS_FILE="$(find "$RUNNER_TEMP/v12-source" -type f \( -name settings.gradle -o -name settings.gradle.kts \) -print -quit)"
+          if [ -z "$SETTINGS_FILE" ]; then
+            echo "Não foi encontrado settings.gradle dentro do ZIP."
+            exit 1
+          fi
+
+          PROJECT_ROOT="$(dirname "$SETTINGS_FILE")"
+          if [ ! -f "$PROJECT_ROOT/app/build.gradle" ] && [ ! -f "$PROJECT_ROOT/app/build.gradle.kts" ]; then
+            echo "A raiz Gradle foi encontrada, mas o módulo app não foi localizado."
+            exit 1
+          fi
+
+          echo "project_root=$PROJECT_ROOT" >> "$GITHUB_OUTPUT"
+          echo "Projeto localizado em: $PROJECT_ROOT"
+          echo "Gradle wrapper presente: $([ -f "$PROJECT_ROOT/gradlew" ] && echo sim || echo não)"
+          echo "Wrapper JAR presente: $([ -f "$PROJECT_ROOT/gradle/wrapper/gradle-wrapper.jar" ] && echo sim || echo não)"
+
+      - name: Build V12 Debug APK
+        working-directory: ${{ steps.source.outputs.project_root }}
+        run: |
+          SDK_PATH="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          if [ -z "$SDK_PATH" ]; then
+            echo "ANDROID_HOME/ANDROID_SDK_ROOT não foi definido pelo setup do Android SDK."
+            exit 1
+          fi
+          printf 'sdk.dir=%s\n' "$SDK_PATH" > local.properties
+          gradle --version
+          gradle --no-daemon --stacktrace assembleDebug
+
+      - name: Verify APK output
+        working-directory: ${{ steps.source.outputs.project_root }}
+        run: |
+          APK="$(find app/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          if [ -z "$APK" ]; then
+            echo "O Gradle terminou sem gerar APK debug."
+            exit 1
+          fi
+          ls -lh "$APK"
+
+      - name: Upload V12 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: V12-12.0.0.14-BUILD25-debug
+          path: ${{ steps.source.outputs.project_root }}/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
